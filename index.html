@@ -63,7 +63,7 @@
   </head>
   <body>
     <div id="ui-layer">
-      <h1>Hex Sort Physics</h1>
+      <h1>Hex Sort Game</h1>
       <div id="score">0 / 6</div>
       <div class="instructions">
         Drag rings to rotate. <br/> Align with the notch to drop. <br/> Double Tap to enable sound
@@ -294,7 +294,7 @@
               texture.flipY = true;
               //   texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
               //   texture.repeat.set(4, 4); // Repeat to avoid visible tiling
-              scene.background = texture;
+              scene.background = texture || new THREE.Color(0xf0f0f0);
             }
           },
           undefined,
