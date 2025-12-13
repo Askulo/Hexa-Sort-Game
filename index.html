@@ -1,0 +1,1304 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>Hex Sort Physics Game</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        background-color: #f0f0f0;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      }
+      #canvas-container {
+        width: 100vw;
+        height: 100vh;
+        display: block;
+      }
+      #ui-layer {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        pointer-events: none;
+        color: #333;
+      }
+      h1 {
+        margin: 0;
+        font-size: 24px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+      }
+      #score {
+        font-size: 40px;
+        font-weight: bold;
+        color: #ff3333;
+      }
+      .instructions {
+        font-size: 14px;
+        opacity: 0.7;
+        margin-top: 5px;
+      }
+      /* #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(255,255,255,0.9); padding: 20px; border-radius: 10px;
+            font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        } */
+    </style>
+
+    <!-- Import Maps for Three.js and Rapier -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+          "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.11.2/rapier.es.js",
+          "gsap": "https://cdn.jsdelivr.net/npm/gsap@3.12.5/index.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="ui-layer">
+      <h1>Hex Sort Physics</h1>
+      <div id="score">0 / 6</div>
+      <div class="instructions">
+        Drag rings to rotate. <br/> Align with the notch to drop. <br/> Double Tap to enable sound
+      </div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import RAPIER from "@dimforge/rapier3d-compat";
+      import { gsap } from "gsap";
+
+      // --- GAME CONFIGURATION ---
+      const CONFIG = {
+        hexRadius: 1.3,
+        circleRadius: 8.5,
+        numberOfStacks: 20,
+        // Explicit Y positions for the 6 layers of stacks
+        // -11.8 is the new bottom base layer
+        stackHeights: [-11.8, -8.0, -4.0, 0.0, 4.0, 8.0],
+        // Notched Circles only at these heights (Base -11.8 has no hole)
+        notchHeights: [-8.0, -4.0, 0.0, 4.0, 8.0, -11.8],
+        colors: [0xff3333, 0x33ff33, 0x3333ff, 0xffff33, 0x33ffff, 0xff00ff],
+        rotationSnap: 18 * (Math.PI / 180),
+      };
+
+      // --- GLOBAL VARIABLES ---
+      let scene, camera, renderer, world, controls;
+      let eventQueue;
+      let layers = [];
+      let score = 0;
+      let isDragging = false;
+      let dragStartX = 0;
+      let activeLayerIndex = -1;
+      let gameCount = 0;
+      
+
+      // --- AUDIO SYSTEM ---
+      // --- AUDIO SYSTEM ---
+      let audioCtx = null;
+      let audioUnlocked = false;
+      
+
+      function getAudioCtx() {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        return audioCtx;
+      }
+
+      const lastSoundTime = new Map();
+
+      // Initialize audio context early
+      function initAudioContext() {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        
+        // Always try to resume if suspended
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume().then(() => {
+            console.log("Audio context resumed");
+            audioUnlocked = true;
+          }).catch(err => {
+            console.warn("Failed to resume audio:", err);
+          });
+        } else if (audioCtx.state === "running") {
+          audioUnlocked = true;
+        }
+        
+        return audioCtx;
+      }
+
+      // Unlock audio on ANY user interaction
+      function unlockAudioContext() {
+        const ctx = getAudioCtx(); // Ensure context exists
+        
+        if (ctx.state === "suspended") {
+          ctx.resume().then(() => {
+            console.log("Audio unlocked via user interaction");
+            audioUnlocked = true;
+          });
+        }
+
+        // Play silent sound to fully unlock on iOS
+        try {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          gain.gain.value = 0.001;
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.01);
+          audioUnlocked = true;
+        } catch (err) {
+          console.warn("Silent sound failed:", err);
+        }
+      }
+
+      // Set up multiple unlock listeners
+      function setupAudioUnlock() {
+        const unlockEvents = ['touchstart', 'touchend', 'mousedown', 'click', 'keydown'];
+        
+        const unlock = () => {
+          unlockAudioContext();
+          // Remove listeners once unlocked to clean up
+          if (audioUnlocked) {
+             unlockEvents.forEach(event => {
+                document.removeEventListener(event, unlock);
+             });
+          }
+        };
+        
+        unlockEvents.forEach(event => {
+          document.addEventListener(event, unlock, { passive: true });
+        });
+      }
+      await RAPIER.init();
+      world = new RAPIER.World({ x: 0.0, y: -70.0, z: 0.0 });
+      scene = new THREE.Scene();
+
+      function playSound(type, intensity = 1.0) {
+        // 1. Initialize/Get Context FIRST
+        const ctx = getAudioCtx();
+
+        // 2. Resume if suspended (browser policy)
+        if (ctx.state === "suspended") {
+            ctx.resume().catch((err) => console.warn("Audio resume failed", err));
+        }
+
+        // 3. Play Sound
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        if (type === "tick") {
+          const start = ctx.currentTime;
+
+          // New Mechanical/Wood Click Sound
+          const clickOsc = ctx.createOscillator();
+          const clickGain = ctx.createGain();
+
+          // Triangle wave gives a hollower, woody texture
+          clickOsc.type = "triangle";
+
+          // Quick pitch drop simulates the impact/click
+          clickOsc.frequency.setValueAtTime(1000, start);
+          clickOsc.frequency.exponentialRampToValueAtTime(200, start + 0.08);
+
+          // Very sharp amplitude envelope for a "click" feel
+          clickGain.gain.setValueAtTime(0, start);
+          clickGain.gain.linearRampToValueAtTime(0.5 * intensity, start + 0.005);
+          clickGain.gain.exponentialRampToValueAtTime(0.001, start + 0.1);
+
+          clickOsc.connect(clickGain);
+          clickGain.connect(ctx.destination);
+
+          clickOsc.start(start);
+          clickOsc.stop(start + 0.15);
+        } else if (type === "win") {
+          const start = ctx.currentTime;
+          // Play a bright major chord arpeggio (C Major: C, E, G, C)
+          const notes = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6
+          
+          notes.forEach((freq, i) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(freq, start + i * 0.08); // Stagger notes
+            
+            // Envelope
+            gain.gain.setValueAtTime(0, start + i * 0.08);
+            gain.gain.linearRampToValueAtTime(0.2, start + i * 0.08 + 0.05);
+            gain.gain.exponentialRampToValueAtTime(0.001, start + i * 0.08 + 0.8);
+            
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            
+            osc.start(start + i * 0.08);
+            osc.stop(start + i * 0.08 + 0.9);
+          });
+
+        } else if (type === "thud") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+          osc.frequency.exponentialRampToValueAtTime(
+            40,
+            audioCtx.currentTime + 0.2
+          );
+          gain.gain.setValueAtTime(0.8 * intensity, audioCtx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(
+            0.01,
+            audioCtx.currentTime + 0.2
+          );
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start();
+          osc.stop(audioCtx.currentTime + 0.2);
+        }
+      }
+
+      function playSmartSound(stackId, velocity) {
+        const now = performance.now();
+        const lastTime = lastSoundTime.get(stackId) || 0;
+        const force = Math.min(Math.abs(velocity), 15) / 15;
+
+        if (now - lastTime > 80 && force > 0.05) {
+          if (force > 0.5) playSound("thud", force);
+          else playSound("tick", force);
+          lastSoundTime.set(stackId, now);
+        }
+      }
+
+      // --- INIT FUNCTION ---
+      async function init() {
+        eventQueue = new RAPIER.EventQueue(true);
+        
+
+        // Load wood texture and set as scene background
+        const loader = new THREE.TextureLoader();
+        loader.load(
+          "../Textures/wood2_01.png",
+          (texture) => {
+            if (texture) {
+              //texture.ColorSpace = THREE.SRGBEncoding;
+              texture.flipY = true;
+              //   texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+              //   texture.repeat.set(4, 4); // Repeat to avoid visible tiling
+              scene.background = texture;
+            }
+          },
+          undefined,
+          (err) => {
+            console.warn("Failed to load background texture:", err);
+          }
+        );
+        //scene.background = new THREE.Color(0xf0f0f0);
+        //scene.fog = new THREE.Fog(0xf0f0f0, 20, 60);
+
+        camera = new THREE.PerspectiveCamera(
+          75,
+          window.innerWidth / window.innerHeight,
+          0.1,
+          100
+        );
+        camera.position.set(0, 14, 35);
+        camera.rotation.x = -0.2;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document
+          .getElementById("canvas-container")
+          .appendChild(renderer.domElement);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(0, 14, 30);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        //Outer
+
+        /* controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.maxPolarAngle = Math.PI / 2 - 0.1;
+            controls.minDistance = 10;
+            controls.maxDistance = 60; */
+
+        buildStaticLevel();
+        buildDynamicStacks();
+        setupInteraction();
+        setupAudioUnlock(); // <--- ADDED: Start looking for user taps to unlock audio
+
+        animate();
+      }
+
+      //Outer Boundary Circle
+
+      // --- LEVEL GENERATION ---
+
+      function createCutCircle(y, isVisible) {
+        const radius = 10;
+        const notchTopWidth = 4.2;
+        const notchBottomWidth = 2.2;
+        const notchDepth = 3.5;
+
+        const shape = new THREE.Shape();
+        const halfTopW = notchTopWidth / 2;
+        const rimY = Math.sqrt(radius * radius - halfTopW * halfTopW);
+        const angleRight = Math.atan2(rimY, halfTopW);
+        const angleLeft = Math.PI - angleRight;
+
+        shape.absarc(0, 0, radius, angleLeft, angleRight, false);
+
+        const notchFloorY = rimY - notchDepth;
+        const halfBottomW = notchBottomWidth / 2;
+        shape.lineTo(halfBottomW, notchFloorY);
+        shape.lineTo(-halfBottomW, notchFloorY);
+        shape.lineTo(-halfTopW, rimY);
+
+        const extrudeSettings = {
+          steps: 2,
+          depth: 0.2,
+          bevelEnabled: true,
+          bevelThickness: 0.1,
+          bevelSize: 0.02,
+          bevelSegments: 3,
+        };
+        const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+        geometry.center();
+
+        const material = new THREE.MeshStandardMaterial({
+          color: 0xf4e2bd,
+          roughness: 0.4,
+          metalness: 0.2,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+
+        mesh.rotation.x = -Math.PI / 2;
+        mesh.rotation.z = Math.PI;
+        mesh.position.set(0, y, 0);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.userData = { isGround: true };
+
+        if (isVisible) {
+          scene.add(mesh);
+        }
+
+        const bodyDesc = RAPIER.RigidBodyDesc.fixed()
+          .setTranslation(0, y, 0)
+          .setRotation({
+            x: mesh.quaternion.x,
+            y: mesh.quaternion.y,
+            z: mesh.quaternion.z,
+            w: mesh.quaternion.w,
+          });
+        const body = world.createRigidBody(bodyDesc);
+
+        const vertices = geometry.attributes.position.array;
+        const indices = geometry.index
+          ? geometry.index.array
+          : [...Array(vertices.length / 3).keys()];
+        const colliderDesc = RAPIER.ColliderDesc.trimesh(
+          vertices,
+          indices
+        ).setFriction(0.5);
+        world.createCollider(colliderDesc, body);
+      }
+
+      function buildStaticLevel() {
+        // 1. Bottom Ground at -12
+        createCircularGround(-12.05);
+
+        // 2. Rings at specific heights (-8, -4, 0, 4, 8)
+        // Note: No CutCircle at -11.8 (Base layer sits on ground)
+        CONFIG.notchHeights.forEach((y) => {
+          createCutCircle(y, y !== -11.8);
+          
+        });
+
+        // 3. Top Ground at +12
+        createCircularGround(12);
+      }
+
+      function createCircularGround(y) {
+        // --- VISUAL ---
+        const geo = new THREE.CylinderGeometry(10, 10, 0.5, 64);
+        const mat = new THREE.MeshStandardMaterial({ color: 0xf4e2bd });
+        const mesh = new THREE.Mesh(geo, mat);
+
+        mesh.position.set(0, y, 0);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+
+        // --- PHYSICS (TRIMESH) ---
+        const bodyDesc = RAPIER.RigidBodyDesc.fixed()
+          .setTranslation(mesh.position.x, mesh.position.y, mesh.position.z)
+          .setRotation({
+            x: mesh.quaternion.x,
+            y: mesh.quaternion.y,
+            z: mesh.quaternion.z,
+            w: mesh.quaternion.w,
+          });
+
+        const body = world.createRigidBody(bodyDesc);
+
+        // IMPORTANT: Use non-indexed geometry for stable trimesh
+        const nonIndexed = geo.toNonIndexed();
+        const vertices = nonIndexed.attributes.position.array;
+
+        // Generate indices manually (0..N)
+        const indices = Array.from(
+          { length: vertices.length / 3 },
+          (_, i) => i
+        );
+
+        const colliderDesc = RAPIER.ColliderDesc.trimesh(vertices, indices)
+          .setFriction(0.6)
+          .setRestitution(0.0);
+
+        world.createCollider(colliderDesc, body);
+      }
+
+      // --- DYNAMIC STACKS ---
+
+      function createHexStack(x, y, z, color, layerIndex, initialAngle) {
+        const group = new THREE.Group();
+
+        const depth = 0.23;
+        const bevel = 0.25;
+        const tileHeight = depth + bevel * 2;
+        const hexShape = new THREE.Shape();
+        for (let i = 0; i < 6; i++) {
+          const angle = (i / 6) * Math.PI * 2;
+          const px = Math.cos(angle) * CONFIG.hexRadius;
+          const py = Math.sin(angle) * CONFIG.hexRadius;
+          if (i === 0) hexShape.moveTo(px, py);
+          else hexShape.lineTo(px, py);
+        }
+        hexShape.closePath();
+
+        const geo = new THREE.ExtrudeGeometry(hexShape, {
+          depth: depth,
+          bevelEnabled: true,
+          bevelThickness: bevel,
+          bevelSize: 0.1,
+          bevelSegments: 2,
+        });
+        geo.center();
+        const mat = new THREE.MeshStandardMaterial({
+          color: color,
+          roughness: 0.3,
+        });
+
+        for (let i = 0; i < 5; i++) {
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.rotation.x = -Math.PI / 2;
+          mesh.position.y = -tileHeight * 2.5 + i * tileHeight + tileHeight / 2;
+          mesh.castShadow = true;
+          group.add(mesh);
+        }
+
+        // Physics body origin is Y+2 to center the collider
+        group.position.set(x, y + 2, z);
+        scene.add(group);
+
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+          .setTranslation(x, y + 2, z)
+          .lockRotations()
+          .setLinearDamping(0.5);
+
+        const body = world.createRigidBody(bodyDesc);
+        body.lockTranslations(false, false, true);
+        const colDesc = RAPIER.ColliderDesc.cylinder(1.8, CONFIG.hexRadius)
+          .setFriction(0.1)
+          .setRestitution(0.0)
+          .setDensity(2.0)
+          .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+
+        const collider = world.createCollider(colDesc, body);
+
+        const id = Math.random().toString(36).substr(2, 9);
+        const stackData = {
+          mesh: group,
+          body: body,
+          id: id,
+          layerIndex: layerIndex,
+          originalAngle: initialAngle,
+          hasScored: false,
+          // Store initial world position for stable rotation math
+          startPos: { x: x, y: y + 2, z: z },
+        };
+
+        body.userData = stackData;
+        return stackData;
+      }
+
+      function buildDynamicStacks() {
+        // Build stacks at all 6 configured heights
+        CONFIG.stackHeights.forEach((y, index) => {
+          const layerStacks = [];
+
+          for (let i = 0; i < CONFIG.numberOfStacks; i++) {
+            if (i === 5) continue;
+
+            const angle = (i / CONFIG.numberOfStacks) * Math.PI * 2;
+            const x = Math.cos(angle) * CONFIG.circleRadius;
+            const z = Math.sin(angle) * CONFIG.circleRadius;
+
+            const color =
+              CONFIG.colors[Math.floor(Math.random() * CONFIG.colors.length)];
+
+            const stack = createHexStack(x, y, z, color, index, angle);
+            layerStacks.push(stack);
+          }
+
+          layers.push({
+            stacks: layerStacks,
+            rotation: 0,
+            targetRotation: 0,
+            isLocked: false,
+            baseHeight: y, // Store expected height for falling check
+            lastStep: 0, // Track rotation steps for sound
+          });
+        });
+      }
+
+      //Inner Boundary Circle
+      function createHollowCylinderVisual() {
+        const radius = 16.5;
+        const height = 24;
+
+        // -------------------------
+        // THREE.JS VISUAL
+        // -------------------------
+        const path = new THREE.LineCurve3(
+          new THREE.Vector3(0, -height / 2, 0),
+          new THREE.Vector3(0, height / 2, 0)
+        );
+
+        const geometry = new THREE.TubeGeometry(
+          path,
+          64, // tubular segments
+          0.4, // tube thickness
+          64, // radial segments
+          false
+        );
+
+        const material = new THREE.MeshStandardMaterial({
+          color: 0xf4e2bd,
+          roughness: 0.4,
+          metalness: 0.1,
+        });
+
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.scale.set(radius, 1, radius);
+        mesh.position.set(0, 0, 0);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+
+        scene.add(mesh);
+
+        // -------------------------
+        // RAPIER PHYSICS
+        // -------------------------
+
+        // Extract vertices & indices from BufferGeometry
+        const posAttr = geometry.attributes.position;
+        const indexAttr = geometry.index;
+
+        const vertices = [];
+        for (let i = 0; i < posAttr.count; i++) {
+          vertices.push(
+            posAttr.getX(i) * radius,
+            posAttr.getY(i),
+            posAttr.getZ(i) * radius
+          );
+        }
+
+        const indices = indexAttr ? Array.from(indexAttr.array) : null;
+
+        // Fixed rigid body
+        const bodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0);
+        const body = world.createRigidBody(bodyDesc);
+
+        // Trimesh collider (hollow, accurate)
+        const colliderDesc = RAPIER.ColliderDesc.trimesh(vertices, indices);
+        world.createCollider(colliderDesc, body);
+
+        return mesh;
+      }
+
+      createHollowCylinderVisual();
+
+      //Outer Boundary Circle for Debugging
+      function createDebugCylinderTriMesh() {
+        const radius = 10;
+        const height = 24;
+
+        // -------------------------
+        // 1. VISUAL MESH (Three.js)
+        // -------------------------
+        const geometry = new THREE.CylinderGeometry(radius, radius, height, 32);
+        const material = new THREE.MeshBasicMaterial({
+          color: 0xff0000, // Red for debug
+          wireframe: true, // Wireframe to see through it
+          transparent: false,
+          opacity: 0.5,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(0, 0, 0);
+        /*scene.add(mesh); */
+
+        // -------------------------
+        // 2. PHYSICS (Rapier TriMesh)
+        // -------------------------
+        const bodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0);
+        const body = world.createRigidBody(bodyDesc);
+
+        // Extract vertices and indices from Three.js geometry
+        const vertices = geometry.attributes.position.array;
+        let indices;
+
+        if (geometry.index) {
+          indices = geometry.index.array;
+        } else {
+          // Generate indices if they don't exist
+          indices = new Uint32Array([
+            ...Array(geometry.attributes.position.count).keys(),
+          ]);
+        }
+
+        const colliderDesc = RAPIER.ColliderDesc.trimesh(vertices, indices);
+        world.createCollider(colliderDesc, body);
+      }
+
+      // Call the function
+      createDebugCylinderTriMesh();
+
+      // --- INTERACTION ---
+
+      function setupInteraction() {
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener("mousedown", onDown);
+        window.addEventListener("touchstart", (e) => onDown(e.touches[0]));
+
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("touchmove", (e) => onMove(e.touches[0]));
+
+        window.addEventListener("mouseup", onUp);
+        window.addEventListener("touchend", onUp);
+
+        window.addEventListener("touchstart", unlockAudio, { once: true });
+        window.addEventListener("mousedown", unlockAudio, { once: true });
+
+        function onDown(e) {
+          const isAnyAnimating = layers.some(
+            (l) => Math.abs(l.rotation - l.targetRotation) > 0.05
+          );
+          if (isAnyAnimating || isDragging) return;
+
+          mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+          mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+          raycaster.setFromCamera(mouse, camera);
+          const intersects = raycaster.intersectObjects(scene.children, true);
+
+          for (let hit of intersects) {
+            let obj = hit.object;
+            while (obj.parent && obj.parent.type !== "Scene") {
+              obj = obj.parent;
+            }
+
+            const foundStack = findStackByMesh(obj);
+            if (foundStack && !foundStack.hasScored) {
+              const layerIdx = foundStack.layerIndex;
+              if (!layers[layerIdx].isLocked) {
+                isDragging = true;
+                dragStartX = e.clientX;
+                activeLayerIndex = layerIdx;
+                //controls.enabled = false;
+              }
+              break;
+            }
+          }
+        }
+
+        function unlockAudio() {
+          const ctx = getAudioCtx();
+          if (ctx.state === "suspended") {
+            ctx.resume();
+          }
+
+          // Play silent sound to fully unlock on iOS
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          gain.gain.value = 0.001;
+          osc.connect(gain).connect(ctx.destination);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.02);
+
+          window.removeEventListener("touchstart", unlockAudio);
+          window.removeEventListener("mousedown", unlockAudio);
+        }
+
+        function onMove(e) {
+          if (!isDragging || activeLayerIndex === -1) return;
+          const deltaX = e.clientX - dragStartX;
+          const sensitivity = 0.005;
+          layers[activeLayerIndex].targetRotation += deltaX * sensitivity;
+          dragStartX = e.clientX;
+        }
+
+        function onUp() {
+          if (isDragging && activeLayerIndex !== -1) {
+            const currentRot = layers[activeLayerIndex].targetRotation;
+            const snap = CONFIG.rotationSnap;
+            const snappedRot = Math.round(currentRot / snap) * snap;
+            layers[activeLayerIndex].targetRotation = snappedRot;
+            
+          }
+          isDragging = false;
+          activeLayerIndex = -1;
+          //controls.enabled = true;
+        }
+      }
+
+      function findStackByMesh(meshGroup) {
+        for (let l = 0; l < layers.length; l++) {
+          const stack = layers[l].stacks.find((s) => s.mesh === meshGroup);
+          if (stack) return stack;
+        }
+        return null;
+      }
+
+      // --- GAME LOOP ---
+
+      function animate() {
+        requestAnimationFrame(animate);
+        world.step(eventQueue);
+        updateLayers();
+        updateStacks();
+        //controls.update();
+        renderer.render(scene, camera);
+      }
+
+      function updateLayers() {
+        layers.forEach((layer, idx) => {
+          layer.rotation = THREE.MathUtils.lerp(
+            layer.rotation,
+            layer.targetRotation,
+            0.3
+          );
+          
+          // --- TICK SOUND LOGIC ---
+          // Calculate which 18-degree step we are currently in
+          const currentStep = Math.round(layer.rotation / CONFIG.rotationSnap);
+          
+          if (layer.lastStep !== currentStep) {
+            playSound("tick", 0.4); 
+            if (navigator.vibrate) navigator.vibrate(5); // Tactile feedback
+            layer.lastStep = currentStep;
+          }
+
+          const isMoving =
+            Math.abs(layer.rotation - layer.targetRotation) > 0.001;
+
+          layer.stacks.forEach((stack) => {
+            const currentPos = stack.body.translation();
+
+            // Check if stack is still at its designated layer height
+            // The stack body origin is +2 from the start height
+            const expectedBodyY = layer.baseHeight + 2;
+            const isAtLayerHeight =
+              Math.abs(currentPos.y - expectedBodyY) < 1.5;
+            const isFalling = stack.body.linvel().y < -1.0;
+
+            if (
+              isMoving &&
+              !layer.isLocked &&
+              !stack.hasScored &&
+              isAtLayerHeight
+            ) {
+              // Disable gravity while rotating
+              stack.body.setGravityScale(0, true);
+
+              // Use rotation matrix approach (stable)
+              const startPos = stack.startPos || {
+                x: currentPos.x,
+                y: currentPos.y,
+                z: currentPos.z,
+              };
+              // layer.rotation is already in radians
+              const rad = layer.rotation;
+              const cosA = Math.cos(rad);
+              const sinA = -Math.sin(rad);
+
+              const newX = startPos.x * cosA - startPos.z * sinA;
+              const newZ = startPos.x * sinA + startPos.z * cosA;
+
+              // Apply to physics body and visual mesh
+              stack.body.setTranslation(
+                { x: newX, y: currentPos.y, z: newZ },
+                true
+              );
+              stack.mesh.position.set(newX, currentPos.y, newZ);
+
+              // Stability: freeze orientation and kill momentum
+              stack.body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+              stack.mesh.rotation.set(0, 0, 0);
+              stack.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+              stack.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+
+              stack.isRotating = true;
+            } else {
+              if (stack.isRotating) {
+                // Restore gravity once rotation ends
+                stack.body.setGravityScale(1, true);
+              }
+              stack.isRotating = false;
+            }
+          });
+        });
+      }
+
+      function updateStacks() {
+        eventQueue.drainCollisionEvents((handle1, handle2, started) => {
+          if (!started) return;
+          const bodyA = world.getRigidBody(handle1);
+          const bodyB = world.getRigidBody(handle2);
+          if (bodyA) checkImpact(bodyA);
+          if (bodyB) checkImpact(bodyB);
+        });
+
+        layers.forEach((layer) => {
+          layer.stacks.forEach((stack) => {
+            const pos = stack.body.translation();
+            const rot = stack.body.rotation();
+            stack.mesh.position.set(pos.x, pos.y, pos.z);
+            stack.mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
+
+            // Scoring Check
+            if (!stack.hasScored && Math.abs(stack.body.linvel().y) < 0.1) {
+              // Determine if stack has dropped significantly below its start layer
+              const startY = layer.baseHeight;
+              const currentBottomY = pos.y - 2;
+
+              // If it fell at least 2 units, it's considered scored/fallen
+              if (currentBottomY < startY - 0.2) {
+                handleStackScored(stack);
+              }
+            }
+          });
+        });
+      }
+
+      function checkImpact(body) {
+        if (!body.isDynamic()) return;
+        const stack = body.userData;
+        if (!stack || stack.isRotating) return;
+
+        const velY = body.linvel().y;
+        if (velY < -0.5) {
+          playSmartSound(stack.id, velY);
+        }
+      }
+
+      //Stacks dispose
+      function queueRemoval(stack) {
+        const mesh = stack.mesh;
+        const body = stack.body;
+
+        // 1️⃣ Remove physics body from Rapier world
+        if (body) {
+          world.removeRigidBody(body);
+        }
+
+        // 2️⃣ Remove mesh from Three.js scene
+        if (mesh) {
+          scene.remove(mesh);
+          // 3️⃣ Dispose all geometries and materials to free memory
+          mesh.traverse((child) => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) child.material.dispose();
+          });
+        }
+      }
+
+      // --- STACK DISPOSAL ANIMATION ---
+      function disposeFallenStacks(fallenStacks) {
+        const groupSize = 5;
+
+        // Sort stacks top → bottom
+        const sortedStacks = [...fallenStacks].sort(
+          (a, b) => b.mesh.position.y - a.mesh.position.y
+        );
+
+        const masterTL = gsap.timeline({
+          onComplete: () => {
+            // Create a quick lookup for removal
+            const removedIds = new Set(sortedStacks.map((s) => s.id));
+
+            // 1) Remove stacks from layers so they won't be used further
+            layers.forEach((layer) => {
+              layer.stacks = layer.stacks.filter((s) => !removedIds.has(s.id));
+            });
+
+            // 2) Remove physics bodies and meshes safely
+            sortedStacks.forEach((stack) => {
+              queueRemoval(stack);
+              // Clear references for GC and logic safety
+              stack.body = null;
+              stack.mesh = null;
+              stack.removed = true;
+            });
+
+            // 1️⃣ Re-enable rotation for all layers
+            layers.forEach((layer) => {
+              layer.isLocked = false;
+            });
+
+            // 2️⃣ Reset score
+            score = 0;
+            document.getElementById("score").innerText = `${score} / 6`;
+          },
+        });
+
+        sortedStacks.forEach((stack, stackIndex) => {
+          const start = 0; // assuming mesh.children[0..4] are the tiles in stack
+
+          // Iterate in reverse: top → bottom
+          for (let i = start + groupSize - 1; i >= start; i--) {
+            const childMesh = stack.mesh.children[i];
+
+            const startTime =
+              stackIndex * 0.22 + (start + groupSize - 1 - i) * 0.05; // stagger per tile
+
+            // Rotate slightly
+            masterTL.to(
+              childMesh.rotation,
+              {
+                z: childMesh.rotation.z - Math.PI * (0.5 + Math.random() * 0.5),
+                //y: childMesh.rotation.y + Math.PI * (0.5 - Math.random() * 0.5),
+                duration: 0.32,
+                ease: "power2.out",
+              },
+              startTime
+            );
+
+            // Slight lift & scatter
+            masterTL.to(
+              childMesh.position,
+              {
+                y: childMesh.position.y + 0.3 + Math.random() * 0.3,
+                x: childMesh.position.x + (Math.random() - 0.5) * 0.3,
+                z: childMesh.position.z + (Math.random() - 0.5) * 0.3,
+                duration: 0.25,
+                ease: "power1.out",
+              },
+              startTime
+            );
+
+            // Shrink to disappear
+            masterTL.to(
+              childMesh.scale,
+              {
+                x: 0,
+                y: 0,
+                z: 0,
+                duration: 0.25,
+                ease: "power2.in",
+              },
+              startTime + 0.15
+            );
+          }
+        });
+      }
+
+      function handleStackScored(stack) {
+        stack.hasScored = true;
+        score++;
+        // Max score is 5 because the bottom layer (0) never falls, only 1-6 fall
+        document.getElementById("score").innerText = `${score} / 6`;
+        playSound("thud", 1.5);
+
+        // Lock the bottom-most available fall-destination
+        // If score is 1, it means a stack landed on the bottom layer.
+        // We should lock the Bottom Layer (0) so it becomes the static base?
+        // Or lock the layer that just emptied?
+
+        // Per previous logic: Score 1 = Lock Layer 0.
+        const layerToLock = score - 1;
+        if (layerToLock >= 0 && layerToLock < layers.length) {
+          lockLayer(layerToLock);
+        }
+
+        // 🔥 CHECK ONLY AFTER ALL 5 FALL
+        if (score === 6) {
+          checkColorMatchWithBase();
+        }
+      }
+
+      function showGameCTA(imageUrl, storeUrl, titleText) {
+        // Prevent duplicate popups
+        if (document.getElementById("cta-overlay")) return;
+
+        // 1. Create Styles
+        const style = document.createElement("style");
+        style.innerHTML = `
+    /* Overlay */
+    #cta-overlay {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(5px);
+      z-index: 10000; display: flex; justify-content: center; align-items: center;
+      opacity: 0; transition: opacity 0.5s ease;
+    }
+
+    /* Card */
+    #cta-card {
+      background: linear-gradient(180deg, #2b2b2b, #1a1a1a);
+      border: 1px solid #555; padding: 30px; border-radius: 20px;
+      text-align: center; color: white; font-family: sans-serif;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+      transform: scale(0.8); transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      width: 90%; max-width: 320px;
+    }
+
+    /* Game Icon */
+    #cta-image {
+      width: 80px; height: 80px; border-radius: 18px; margin-bottom: 15px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      object-fit: cover;
+    }
+
+    /* Title */
+    #cta-card h2 {
+      margin: 0 0 15px 0;
+      color: #ffd700;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+
+    /* Button */
+    #cta-btn {
+      background-color: #00e676;
+      color: #003300;
+      padding: 15px 25px;
+      border-radius: 50px;
+      text-decoration: none;
+      font-weight: 900;
+      display: inline-block;
+      font-size: 18px;
+      margin-top: 10px;
+      box-shadow: 0 4px 0 #00b35c;
+      transition: all 0.1s;
+      touch-action: manipulation;
+    }
+    #cta-btn:active {
+      transform: translateY(4px);
+      box-shadow: none;
+    }
+
+    /* Close button */
+   /* #cta-close {
+      position: absolute; top: 15px; right: 20px;
+      font-size: 28px; cursor: pointer; color: #aaa;
+      user-select: none;
+    } */
+
+    /* Responsive text and layout */
+    @media (max-width: 480px) {
+      #cta-card { padding: 20px; }
+      #cta-image { width: 70px; height: 70px; }
+      #cta-card h2 { font-size: 18px; }
+      #cta-btn { font-size: 16px; padding: 12px 20px; }
+      #cta-close { font-size: 24px; top: 10px; right: 15px; }
+    }
+  `;
+        document.head.appendChild(style);
+
+        // 2. Create Elements
+        const overlay = document.createElement("div");
+        overlay.id = "cta-overlay";
+
+        const card = document.createElement("div");
+        card.id = "cta-card";
+
+        card.innerHTML = `
+    <img id="cta-image" src="${imageUrl}" alt="Game Icon">
+    <h2>${titleText}</h2>
+    <a id="cta-btn" href="${storeUrl}" target="_blank">INSTALL NOW</a>
+  `;
+
+        const closeBtn = document.createElement("div");
+        closeBtn.id = "cta-close";
+        closeBtn.innerHTML = "&times;";
+        closeBtn.onclick = () => {
+          overlay.style.opacity = "0";
+          card.style.transform = "scale(0.8)";
+          setTimeout(() => overlay.remove(), 500);
+        };
+
+        overlay.appendChild(closeBtn);
+        overlay.appendChild(card);
+        document.body.appendChild(overlay);
+
+        // 3. Animate In
+        requestAnimationFrame(() => {
+          overlay.style.opacity = "1";
+          card.style.transform = "scale(1)";
+        });
+      }
+
+      function showTryAgain() {
+        if (document.getElementById("try-again-overlay")) return;
+
+        const overlay = document.createElement("div");
+        overlay.id = "try-again-overlay";
+        overlay.style.cssText = `
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(5px);
+            z-index: 10000; display: flex; justify-content: center; align-items: center;
+            opacity: 0; transition: opacity 0.5s ease;
+            font-family: sans-serif; color: white;
+        `;
+
+        const card = document.createElement("div");
+        card.style.cssText = `
+            background: linear-gradient(180deg, #2b2b2b, #1a1a1a);
+            border: 1px solid #555; padding: 40px; border-radius: 20px;
+            text-align: center;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.6);
+            transform: scale(0.8); transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        `;
+
+        card.innerHTML = `
+            <h2 style="margin: 0 0 20px 0; color: #ff3333; font-size: 32px;">Mismatch!</h2>
+            <p style="margin-bottom: 30px; color: #ccc;">The colors didn't match.</p>
+            <button id="reset-btn" style="
+                background-color: #ff3333; color: white; border: none;
+                padding: 15px 30px; border-radius: 50px; font-weight: bold; font-size: 18px;
+                cursor: pointer; box-shadow: 0 4px 0 #cc0000; transition: transform 0.1s;
+            ">TRY AGAIN</button>
+        `;
+
+        overlay.appendChild(card);
+        document.body.appendChild(overlay);
+
+        requestAnimationFrame(() => {
+            overlay.style.opacity = "1";
+            card.style.transform = "scale(1)";
+        });
+
+        document.getElementById("reset-btn").onclick = () => {
+             resetGame();
+             overlay.style.opacity = "0";
+             setTimeout(() => overlay.remove(), 500);
+        };
+      }
+
+      function resetGame() {
+         layers.forEach(layer => {
+             layer.stacks.forEach(stack => {
+                 queueRemoval(stack);
+             });
+         });
+
+         layers = [];
+         score = 0;
+         document.getElementById("score").innerText = "0 / 6";
+         activeLayerIndex = -1;
+         isDragging = false;
+         
+         // Remove any existing CTA
+         const cta = document.getElementById("cta-overlay");
+         if(cta) cta.remove();
+
+         buildDynamicStacks();
+      }
+
+      function checkColorMatchWithBase() {
+        // 1️⃣ Get base layer
+    
+        // 4️⃣ Collect fallen stacks (should be 5)
+        const fallenStacks = layers
+          .flatMap((layer) => layer.stacks)
+          .filter((stack) => stack.hasScored);
+
+        if (fallenStacks.length !== 6) {
+          console.log("Not all stacks have fallen yet");
+          return;
+        }
+
+        // 5️⃣ Compare colors ONLY among fallen stacks
+        const referenceColor =
+          fallenStacks[0].mesh.children[0].material.color.getHex();
+
+        const allSameColor = fallenStacks.every((stack) => {
+          const stackColor = stack.mesh.children[0].material.color.getHex();
+          return stackColor === referenceColor;
+        });
+
+        // 6️⃣ Log result
+        if (allSameColor) {
+          playSound("win");
+          console.log("🎉 MATCH: All stacks + base have SAME COLOR");
+          gameCount++;
+          if (gameCount >= 2) {
+            console.log("🏆 Triple Win! Resetting game count.");
+            setTimeout(() => {
+              showGameCTA(
+                "https://play-lh.googleusercontent.com/aDgFim7JsMkXva98Ix3usrrT4RdQIWfG3o9-FwyeFPynKNUUI3HKGliOR_p-1IB07VM=s96-rw", // Replace with your game icon URL
+                "https://play.google.com/store/apps/details?id=com.gamebrain.hexasort", // Replace with your Play Store Link
+                "You Won! Play the Full Game?"
+              );
+            }, 2000); // 2 second delay
+          }
+          disposeFallenStacks(fallenStacks);
+        } else {
+          console.log("❌ NOT MATCH: Colors differ");
+          showTryAgain();
+        }
+      }
+
+      function lockLayer(index) {
+        if (layers[index].isLocked) return;
+        layers[index].isLocked = true;
+
+        layers[index].stacks.forEach((s) => {
+          s.mesh.children.forEach((child) => {
+            //child.material.color.setHex(0x555555);
+          });
+        });
+        console.log("Locked Layer:", index);
+      }
+
+      init();
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    </script>
+  </body>
+</html>
